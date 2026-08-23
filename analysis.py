@@ -1,224 +1,212 @@
 """
-Week 3 Task - Statistical Analysis and Hypothesis Testing
+Week 4 Task - Machine Learning Model Development and Evaluation
 Dataset: Car Features and MSRP (cleaned in Week 1)
 
-Primary hypothesis (H1, two-sample test):
-  H0: Mean MSRP is equal for automatic- and manual-transmission vehicles.
-  H1: Mean MSRP differs between automatic- and manual-transmission vehicles.
-
-Supporting analyses:
-  H2 (one-way ANOVA): Mean MSRP differs across vehicle size classes.
-  H3 (chi-square test of independence): Vehicle size class and transmission
-      type are associated (not independent).
-  H4 (simple linear regression / significance of slope): Engine horsepower
-      is a significant linear predictor of MSRP.
+Business problem: Predict whether a vehicle listing is marketed as
+"Luxury" (derived from the Market Category field) using only its
+objective specifications (price, engine specs, fuel economy, size) -
+i.e. can we tell if a car is a luxury model just from its numbers,
+without reading the marketing copy? This has real value for tasks like
+auto-tagging incomplete listings or auditing manual categorization.
 """
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import seaborn as sns
-from scipy import stats
+from sklearn.model_selection import train_test_split, cross_val_score, learning_curve
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LogisticRegression
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.metrics import (confusion_matrix, classification_report, roc_curve, auc,
+                              accuracy_score, precision_score, recall_score, f1_score,
+                              RocCurveDisplay)
 
 sns.set_theme(style="whitegrid")
-PALETTE = {"a": "#2E86AB", "b": "#D64545", "c": "#E8A33D", "d": "#4C956C"}
 plt.rcParams['axes.titleweight'] = 'bold'
-plt.rcParams['axes.titlesize'] = 13
 plt.rcParams['figure.dpi'] = 150
+RANDOM_STATE = 42
 
+# -----------------------------------------------------------------------
+# 1. DATA PREPARATION
+# -----------------------------------------------------------------------
 df = pd.read_csv('cars_clean.csv')
-ALPHA = 0.05
 
-# Work on a de-outliered set for the mean-based tests to avoid a handful
-# of multi-million-dollar exotics dominating variance; full data is used
-# for the chi-square test since that only concerns category counts.
-core = df[df['msrp'] <= 300000].copy()
-core['log_msrp'] = np.log10(core['msrp'])
+# Target: binary label, 1 if "Luxury" appears in Market Category, else 0.
+# Vehicles with no category info ("Not Specified") are excluded, since we
+# cannot know their true label - including them would introduce label noise.
+df = df[df['market_category'] != 'Not Specified'].copy()
+df['is_luxury'] = df['market_category'].str.contains('Luxury').astype(int)
 
-print("=" * 70)
-print("H1: Automatic vs. Manual transmission - mean MSRP")
-print("=" * 70)
+print("Dataset after excluding unlabeled rows:", df.shape)
+print("Class balance:\n", df['is_luxury'].value_counts(normalize=True))
 
-auto = core.loc[core.transmission_type == 'AUTOMATIC', 'msrp']
-manual = core.loc[core.transmission_type == 'MANUAL', 'msrp']
+# Feature selection: only objective, non-leaking specifications are used.
+# MSRP is deliberately EXCLUDED as a feature even though it's predictive -
+# using price to predict "luxury" would be circular for many real use
+# cases (e.g. auto-tagging a used-market listing where price is what
+# we're often also trying to explain). Engine/fuel/size specs are kept
+# since they describe the vehicle itself, not its market label.
+numeric_features = ['engine_hp', 'engine_cylinders', 'number_of_doors',
+                     'highway_mpg', 'city_mpg', 'popularity', 'year']
+categorical_features = ['vehicle_size', 'driven_wheels', 'transmission_type']
 
-print(f"n(automatic) = {len(auto)}, mean = ${auto.mean():,.0f}, sd = ${auto.std():,.0f}")
-print(f"n(manual)    = {len(manual)}, mean = ${manual.mean():,.0f}, sd = ${manual.std():,.0f}")
+X = df[numeric_features + categorical_features]
+y = df['is_luxury']
 
-# Levene's test for equal variances (informs which t-test variant to use)
-lev_stat, lev_p = stats.levene(auto, manual)
-print(f"\nLevene's test for equal variances: stat={lev_stat:.2f}, p={lev_p:.4g}")
+# Drop any remaining rows with missing values in the selected features
+# (should be none after Week 1 cleaning, verified here for safety)
+mask = X.notna().all(axis=1)
+X, y = X[mask], y[mask]
+print(f"\nFinal modeling set: {X.shape[0]} rows, {X.shape[1]} raw features")
 
-# Welch's t-test (does not assume equal variances) - robust default choice
-t_stat, t_p = stats.ttest_ind(auto, manual, equal_var=False)
-print(f"Welch's t-test: t={t_stat:.3f}, p={t_p:.4g}")
+# 80/20 train-test split, stratified to preserve class balance in both sets
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.20, random_state=RANDOM_STATE, stratify=y
+)
+print(f"Train: {X_train.shape[0]} rows, Test: {X_test.shape[0]} rows")
 
-# 95% CI for the difference in means (Welch-Satterthwaite)
-n1, n2 = len(auto), len(manual)
-m1, m2 = auto.mean(), manual.mean()
-s1, s2 = auto.std(ddof=1), manual.std(ddof=1)
-se = np.sqrt(s1**2/n1 + s2**2/n2)
-dof = (s1**2/n1 + s2**2/n2)**2 / ((s1**2/n1)**2/(n1-1) + (s2**2/n2)**2/(n2-1))
-tcrit = stats.t.ppf(0.975, dof)
-diff = m1 - m2
-ci_low, ci_high = diff - tcrit*se, diff + tcrit*se
-print(f"Difference in means (auto - manual): ${diff:,.0f}, 95% CI: (${ci_low:,.0f}, ${ci_high:,.0f})")
+# Preprocessing pipeline: scale numeric features (required for logistic
+# regression to converge properly and treat features fairly), one-hot
+# encode categoricals. Built as a single ColumnTransformer so it can be
+# fit on training data only and applied identically to the test set,
+# avoiding data leakage.
+preprocessor = ColumnTransformer([
+    ('num', StandardScaler(), numeric_features),
+    ('cat', OneHotEncoder(handle_unknown='ignore'), categorical_features),
+])
 
-# Effect size: Cohen's d (pooled sd)
-pooled_sd = np.sqrt(((n1-1)*s1**2 + (n2-1)*s2**2) / (n1+n2-2))
-cohens_d = diff / pooled_sd
-print(f"Cohen's d: {cohens_d:.3f}")
+# -----------------------------------------------------------------------
+# 2. MODEL SELECTION AND TRAINING
+# -----------------------------------------------------------------------
+# Two simple, interpretable algorithms are compared:
+# - Logistic Regression: a strong, well-calibrated linear baseline, easy
+#   to interpret via coefficients, appropriate given the roughly linear
+#   separability expected between luxury/non-luxury specs.
+# - Decision Tree: captures non-linear interactions (e.g. "high HP AND
+#   Rear-wheel drive") that a linear model would miss, and is equally
+#   interpretable via its rules. Max depth is limited to control
+#   overfitting given the tree's tendency to memorize training data.
 
-# Robustness check: MSRP is right-skewed, so also run the non-parametric
-# Mann-Whitney U test, which does not assume normal distributions.
-u_stat, u_p = stats.mannwhitneyu(auto, manual, alternative='two-sided')
-print(f"Mann-Whitney U test (robustness check): U={u_stat:.0f}, p={u_p:.4g}")
+log_reg = Pipeline([
+    ('prep', preprocessor),
+    ('clf', LogisticRegression(max_iter=1000, random_state=RANDOM_STATE)),
+])
+log_reg.fit(X_train, y_train)
 
-print("\n" + "=" * 70)
-print("H2: One-way ANOVA - MSRP across vehicle size classes")
-print("=" * 70)
+tree = Pipeline([
+    ('prep', preprocessor),
+    ('clf', DecisionTreeClassifier(max_depth=6, min_samples_leaf=20, random_state=RANDOM_STATE)),
+])
+tree.fit(X_train, y_train)
 
-groups = [core.loc[core.vehicle_size == g, 'log_msrp'] for g in ['Compact', 'Midsize', 'Large']]
-f_stat, anova_p = stats.f_oneway(*groups)
-print(f"One-way ANOVA (on log10 MSRP, to address right-skew): F={f_stat:.3f}, p={anova_p:.4g}")
+models = {'Logistic Regression': log_reg, 'Decision Tree': tree}
 
-# Manual sum-of-squares breakdown (equivalent to statsmodels anova_lm output)
-grand_mean = core['log_msrp'].mean()
-ss_between = sum(len(g) * (g.mean() - grand_mean) ** 2 for g in groups)
-ss_within = sum(((g - g.mean()) ** 2).sum() for g in groups)
-ss_total = ss_between + ss_within
-df_between = len(groups) - 1
-df_within = len(core) - len(groups)
-eta_sq = ss_between / ss_total
-print(f"SS_between={ss_between:.3f} (df={df_between}), SS_within={ss_within:.3f} (df={df_within})")
-print(f"Eta-squared (effect size): {eta_sq:.3f}")
+# -----------------------------------------------------------------------
+# 3. EVALUATION
+# -----------------------------------------------------------------------
+results = {}
+for name, model in models.items():
+    y_pred = model.predict(X_test)
+    y_proba = model.predict_proba(X_test)[:, 1]
+    acc = accuracy_score(y_test, y_pred)
+    prec = precision_score(y_test, y_pred)
+    rec = recall_score(y_test, y_pred)
+    f1 = f1_score(y_test, y_pred)
+    fpr, tpr, _ = roc_curve(y_test, y_proba)
+    roc_auc = auc(fpr, tpr)
 
-# Tukey HSD post-hoc test (pairwise group comparisons)
-tukey = stats.tukey_hsd(*groups)
-print("\nTukey HSD post-hoc test (Compact=0, Midsize=1, Large=2):")
-print(tukey)
+    # 5-fold cross-validation on the training set, to check stability of
+    # accuracy beyond a single train/test split
+    cv_scores = cross_val_score(model, X_train, y_train, cv=5, scoring='accuracy')
+    train_acc = accuracy_score(y_train, model.predict(X_train))
 
-print("\n" + "=" * 70)
-print("H3: Chi-square test - Vehicle Size x Transmission Type")
-print("=" * 70)
-
-top_trans = df['transmission_type'].value_counts().head(3).index  # sufficiently large cells
-ct = pd.crosstab(df.loc[df.transmission_type.isin(top_trans), 'vehicle_size'],
-                  df.loc[df.transmission_type.isin(top_trans), 'transmission_type'])
-print("Contingency table (counts):\n", ct)
-chi2, chi_p, dof_chi, expected = stats.chi2_contingency(ct)
-print(f"\nChi-square test: chi2={chi2:.2f}, dof={dof_chi}, p={chi_p:.4g}")
-n_total = ct.values.sum()
-cramers_v = np.sqrt(chi2 / (n_total * (min(ct.shape) - 1)))
-print(f"Cramer's V (effect size): {cramers_v:.3f}")
-
-print("\n" + "=" * 70)
-print("H4: Simple linear regression - Engine HP predicting MSRP")
-print("=" * 70)
-
-reg_data = core.dropna(subset=['engine_hp', 'msrp'])
-lin = stats.linregress(reg_data['engine_hp'], reg_data['log_msrp'])
-print(f"Slope: {lin.slope:.6f}, Intercept: {lin.intercept:.4f}")
-print(f"R-value: {lin.rvalue:.4f}, R-squared: {lin.rvalue**2:.4f}")
-print(f"p-value (slope != 0): {lin.pvalue:.4g}")
-print(f"Std error of slope: {lin.stderr:.6f}")
-n_reg = len(reg_data)
-tcrit_reg = stats.t.ppf(0.975, n_reg - 2)
-slope_ci_low = lin.slope - tcrit_reg * lin.stderr
-slope_ci_high = lin.slope + tcrit_reg * lin.stderr
-print(f"95% CI for slope: ({slope_ci_low:.6f}, {slope_ci_high:.6f})")
+    results[name] = dict(y_pred=y_pred, y_proba=y_proba, acc=acc, prec=prec, rec=rec, f1=f1,
+                          fpr=fpr, tpr=tpr, roc_auc=roc_auc, cv_mean=cv_scores.mean(),
+                          cv_std=cv_scores.std(), train_acc=train_acc)
+    print(f"\n=== {name} ===")
+    print(f"Train accuracy: {train_acc:.3f} | Test accuracy: {acc:.3f}")
+    print(f"5-fold CV accuracy: {cv_scores.mean():.3f} +/- {cv_scores.std():.3f}")
+    print(f"Precision: {prec:.3f}, Recall: {rec:.3f}, F1: {f1:.3f}, ROC-AUC: {roc_auc:.3f}")
+    print(classification_report(y_test, y_pred, target_names=['Non-Luxury', 'Luxury']))
 
 # -----------------------------------------------------------------------
 # VISUALIZATIONS
 # -----------------------------------------------------------------------
 
-# Viz 1: Boxplot + strip comparison, Automatic vs Manual
-fig, ax = plt.subplots(figsize=(8, 6))
-sns.boxplot(data=core[core.transmission_type.isin(['AUTOMATIC', 'MANUAL'])],
-            x='transmission_type', y='msrp', hue='transmission_type',
-            palette={'AUTOMATIC': PALETTE['a'], 'MANUAL': PALETTE['b']}, legend=False, ax=ax, showfliers=False)
-ax.set_title("MSRP by Transmission Type (H1)")
-ax.set_xlabel("Transmission Type")
-ax.set_ylabel("MSRP (USD)")
-ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"${x:,.0f}"))
-sns.despine()
-plt.tight_layout()
-plt.savefig('viz1_transmission_boxplot.png', dpi=150)
-plt.close()
-
-# Viz 2: QQ plot for log(MSRP) to visually assess normality assumption
+# Viz 1: Confusion matrices, side by side
 fig, axes = plt.subplots(1, 2, figsize=(11, 5))
-stats.probplot(auto, dist="norm", plot=axes[0])
-axes[0].set_title("Q-Q Plot: Automatic MSRP (raw)")
-stats.probplot(np.log10(auto), dist="norm", plot=axes[1])
-axes[1].set_title("Q-Q Plot: Automatic log10(MSRP)")
+for ax, (name, res) in zip(axes, results.items()):
+    cm = confusion_matrix(y_test, res['y_pred'])
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax, cbar=False,
+                xticklabels=['Non-Luxury', 'Luxury'], yticklabels=['Non-Luxury', 'Luxury'])
+    ax.set_title(f"{name}\nAccuracy = {res['acc']:.2%}")
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("Actual")
 plt.tight_layout()
-plt.savefig('viz2_qqplot.png', dpi=150)
+plt.savefig('viz1_confusion_matrices.png', dpi=150)
 plt.close()
 
-# Viz 3: ANOVA - distribution by vehicle size (violin) with means marked
-fig, ax = plt.subplots(figsize=(8, 6))
-sns.violinplot(data=core, x='vehicle_size', y='log_msrp', hue='vehicle_size',
-               order=['Compact', 'Midsize', 'Large'], palette='Set2', ax=ax, cut=0, legend=False)
-means = core.groupby('vehicle_size')['log_msrp'].mean().reindex(['Compact', 'Midsize', 'Large'])
-ax.scatter(range(3), means.values, color='black', marker='D', s=60, zorder=5, label='Group Mean')
-ax.set_title("log10(MSRP) by Vehicle Size (H2 - ANOVA)")
-ax.set_xlabel("Vehicle Size")
-ax.set_ylabel("log10(MSRP)")
-ax.legend()
+# Viz 2: ROC curves, both models overlaid
+fig, ax = plt.subplots(figsize=(7, 6))
+colors = {'Logistic Regression': '#2E86AB', 'Decision Tree': '#D64545'}
+for name, res in results.items():
+    ax.plot(res['fpr'], res['tpr'], color=colors[name], linewidth=2.2,
+            label=f"{name} (AUC = {res['roc_auc']:.3f})")
+ax.plot([0, 1], [0, 1], linestyle='--', color='gray', linewidth=1, label='Random guess (AUC = 0.50)')
+ax.set_title("ROC Curve Comparison")
+ax.set_xlabel("False Positive Rate")
+ax.set_ylabel("True Positive Rate")
+ax.legend(loc='lower right')
 sns.despine()
 plt.tight_layout()
-plt.savefig('viz3_anova_violin.png', dpi=150)
+plt.savefig('viz2_roc_curves.png', dpi=150)
 plt.close()
 
-# Viz 4: Chi-square - stacked proportion bar chart
-ct_prop = ct.div(ct.sum(axis=1), axis=0)
+# Viz 3: Feature importance (Decision Tree) / Coefficient magnitude (LogReg)
+feat_names = (numeric_features +
+              list(tree.named_steps['prep'].named_transformers_['cat'].get_feature_names_out(categorical_features)))
+importances = tree.named_steps['clf'].feature_importances_
+imp_df = pd.DataFrame({'feature': feat_names, 'importance': importances}).sort_values('importance', ascending=True).tail(10)
+
 fig, ax = plt.subplots(figsize=(8, 6))
-ct_prop.plot(kind='bar', stacked=True, ax=ax,
-             color=[PALETTE['a'], PALETTE['b'], PALETTE['c']], edgecolor='white')
-ax.set_title("Transmission Type Share by Vehicle Size (H3 - Chi-square)")
-ax.set_xlabel("Vehicle Size")
-ax.set_ylabel("Proportion of Listings")
-ax.legend(title="Transmission Type", bbox_to_anchor=(1.02, 1), loc='upper left')
-plt.xticks(rotation=0)
+ax.barh(imp_df['feature'], imp_df['importance'], color='#4C956C')
+ax.set_title("Top 10 Feature Importances (Decision Tree)")
+ax.set_xlabel("Importance")
 sns.despine()
 plt.tight_layout()
-plt.savefig('viz4_chisquare_stacked.png', dpi=150)
+plt.savefig('viz3_feature_importance.png', dpi=150)
 plt.close()
 
-# Viz 5: Regression - scatter + fitted line, HP vs log(MSRP)
+# Viz 4: Learning curve for Logistic Regression - diagnose over/underfitting
+train_sizes, train_scores, val_scores = learning_curve(
+    log_reg, X_train, y_train, cv=5, scoring='accuracy',
+    train_sizes=np.linspace(0.1, 1.0, 8), random_state=RANDOM_STATE
+)
 fig, ax = plt.subplots(figsize=(8, 6))
-sample = reg_data.sample(n=min(2500, len(reg_data)), random_state=42)
-ax.scatter(sample['engine_hp'], sample['log_msrp'], alpha=0.25, s=15, color=PALETTE['a'])
-x_line = np.linspace(reg_data['engine_hp'].min(), reg_data['engine_hp'].max(), 100)
-y_line = lin.intercept + lin.slope * x_line
-ax.plot(x_line, y_line, color=PALETTE['b'], linewidth=2.5, label='OLS fit')
-ax.set_title(f"Engine HP vs. log10(MSRP) — OLS Fit (H4, R² = {lin.rvalue**2:.2f})")
-ax.set_xlabel("Engine Horsepower")
-ax.set_ylabel("log10(MSRP)")
-ax.legend()
+ax.plot(train_sizes, train_scores.mean(axis=1), 'o-', color='#2E86AB', label='Training accuracy')
+ax.fill_between(train_sizes, train_scores.mean(axis=1) - train_scores.std(axis=1),
+                 train_scores.mean(axis=1) + train_scores.std(axis=1), alpha=0.15, color='#2E86AB')
+ax.plot(train_sizes, val_scores.mean(axis=1), 'o-', color='#D64545', label='Cross-validation accuracy')
+ax.fill_between(train_sizes, val_scores.mean(axis=1) - val_scores.std(axis=1),
+                 val_scores.mean(axis=1) + val_scores.std(axis=1), alpha=0.15, color='#D64545')
+ax.set_title("Learning Curve — Logistic Regression")
+ax.set_xlabel("Training Set Size")
+ax.set_ylabel("Accuracy")
+ax.legend(loc='lower right')
 sns.despine()
 plt.tight_layout()
-plt.savefig('viz5_regression_fit.png', dpi=150)
+plt.savefig('viz4_learning_curve.png', dpi=150)
 plt.close()
 
 print("\nAll visualizations saved.")
 
-# Save key numbers for the report
-results = {
-    'auto_mean': auto.mean(), 'manual_mean': manual.mean(),
-    'diff': diff, 'ci_low': ci_low, 'ci_high': ci_high,
-    't_stat': t_stat, 't_p': t_p, 'cohens_d': cohens_d,
-    'levene_p': lev_p, 'u_stat': u_stat, 'u_p': u_p,
-    'anova_f': f_stat, 'anova_p': anova_p, 'eta_sq': eta_sq,
-    'chi2': chi2, 'chi_p': chi_p, 'cramers_v': cramers_v, 'chi_dof': dof_chi,
-    'reg_slope': lin.slope, 'reg_intercept': lin.intercept,
-    'reg_r2': lin.rvalue**2, 'reg_p': lin.pvalue,
-    'reg_se': lin.stderr,
-    'reg_ci_low': slope_ci_low, 'reg_ci_high': slope_ci_high,
-    'ss_between': ss_between, 'ss_within': ss_within, 'df_between': df_between, 'df_within': df_within,
-}
 import json
+summary = {name: {k: (float(v) if isinstance(v, (int, float, np.floating)) else None)
+                   for k, v in res.items() if k in ['acc', 'prec', 'rec', 'f1', 'roc_auc', 'cv_mean', 'cv_std', 'train_acc']}
+           for name, res in results.items()}
 with open('results.json', 'w') as f:
-    json.dump({k: float(v) for k, v in results.items()}, f, indent=2)
-print(json.dumps({k: round(float(v), 4) for k, v in results.items()}, indent=2))
+    json.dump(summary, f, indent=2)
+print(json.dumps(summary, indent=2))

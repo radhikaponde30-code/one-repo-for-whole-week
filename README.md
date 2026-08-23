@@ -1,36 +1,44 @@
-# Statistical Analysis and Hypothesis Testing — Car Features & MSRP
+# Machine Learning Model Development — Predicting "Luxury" Car Classification
 
-Week 3 internship task: statistical hypothesis testing in Python on a cleaned
-car-listings dataset (11,199 rows, from Week 1 data cleaning).
+Week 4 internship task: build and evaluate a binary classifier in Python
+predicting whether a vehicle is marketed as "Luxury" using only its
+objective specifications (no price used as a feature).
 
-## Business Questions Tested
+## Business Question
 
-| # | Question | Test | Result |
-|---|----------|------|--------|
-| H1 | Does transmission type affect price? | Welch's t-test + Mann-Whitney U | Rejected H0 (p < 0.0001); auto ≈ $11,900 higher than manual |
-| H2 | Does vehicle size affect price? | One-way ANOVA + Tukey HSD | Rejected H0 (p < 0.0001); all size pairs differ |
-| H3 | Are size and transmission related? | Chi-square test of independence | Rejected H0 (p < 0.0001); Cramer's V = 0.32 |
-| H4 | Does horsepower predict price? | Simple linear regression (OLS) | Rejected H0 (p < 0.0001); R² = 0.44 |
+Can a vehicle's engine, fuel economy, size, and drivetrain specs predict
+whether it's marketed as "Luxury" — useful for auto-tagging incomplete
+listings or auditing manufacturer categorization.
+
+## Models Compared
+
+| Model | Test Accuracy | Precision | Recall | F1 | ROC-AUC |
+|---|---|---|---|---|---|
+| Logistic Regression | 78.4% | 0.772 | 0.676 | 0.721 | 0.832 |
+| Decision Tree (depth=6) | 91.4% | 0.885 | 0.910 | 0.898 | 0.969 |
+
+Both models were cross-validated (5-fold) and checked for overfitting via
+train/test/CV accuracy comparison and a learning curve analysis.
+
+## Key Finding / Caveat
+
+The Decision Tree's top feature by a wide margin is `popularity` (~60% of
+importance), which is a near-constant score per manufacturer in this
+dataset — meaning the model may be leaning on brand identity as a proxy
+for "luxury" rather than genuine specification signal. See the full report
+for discussion and suggested follow-up experiments.
 
 ## Files
 
-- `analysis.py` — full analysis script (data prep, all 4 hypothesis tests, visualizations)
-- `cars_clean.csv` — cleaned dataset used for this analysis (see Week 1 report for cleaning methodology)
-- `results.json` — key statistics from each test (means, p-values, effect sizes, confidence intervals)
-- `viz1_transmission_boxplot.png` — MSRP by transmission type
-- `viz2_qqplot.png` — normality check (Q-Q plots, raw vs. log-transformed MSRP)
-- `viz3_anova_violin.png` — MSRP distribution by vehicle size
-- `viz4_chisquare_stacked.png` — transmission type share by vehicle size
-- `viz5_regression_fit.png` — horsepower vs. price regression fit
+- `analysis.py` — full pipeline: data prep, preprocessing, model training, evaluation, visualizations
+- `cars_clean.csv` — cleaned dataset (from Week 1)
+- `results.json` — key metrics for both models
+- `viz1_confusion_matrices.png`, `viz2_roc_curves.png`, `viz3_feature_importance.png`, `viz4_learning_curve.png`
+- `Week4_ML_Model_Report.docx` — full write-up with methodology and critical discussion
 
 ## How to Run
 
 ```bash
-pip install pandas numpy scipy seaborn matplotlib
+pip install pandas numpy scikit-learn seaborn matplotlib
 python analysis.py
 ```
-
-## Full Write-Up
-
-See the accompanying Word report (`Week3_Statistical_Analysis_Report.docx`) for
-full methodology, assumption checks, and discussion of results.
